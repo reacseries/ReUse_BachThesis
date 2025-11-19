@@ -7,36 +7,38 @@ import numpy as np
 import pyrealsense2 as rs
 from opcua import Client, ua
 import time
+from collections import deque
 
 
 ###############################################
 # 2) OPC UA SETUP
 ###############################################
 def opcua_connect(endpoint="opc.tcp://192.168.0.1:4840"):
-    """Connect to OPC UA server and return client + nodes."""
-
     client = Client(endpoint)
     client.connect()
     print("[OPCUA] Connected")
 
-    # TODO: Replace these placeholders with your real Node IDs
-    node_x = client.get_node("ns=4;i=2")
-    node_y = client.get_node("ns=4;i=3")
-    node_z = client.get_node("ns=4;i=4")
-    node_angle = client.get_node("ns=4;i=5")
+    # TODO: Replace these with your REAL node IDs
+    node_x      = client.get_node("ns=4;i=2")
+    node_y      = client.get_node("ns=4;i=3")
+    node_z      = client.get_node("ns=4;i=4")
+    node_angle  = client.get_node("ns=4;i=5")
+    node_reset  = client.get_node("ns=4;i=6")   # <--- NEW ResetBit variable
 
-    return client, node_x, node_y, node_z, node_angle
+    return client, node_x, node_y, node_z, node_angle, node_reset
 
 
-def opcua_write(node_x, node_y, node_z, node_angle, x, y, z, ang):
-    """Write X/Y/Z/Angle continuously to the PLC."""
+def opcua_write(node_x, node_y, node_z, node_angle, node_reset,
+                x, y, z, ang, resetbit):
     try:
         node_x.set_value(ua.Variant(x, ua.VariantType.Float))
         node_y.set_value(ua.Variant(y, ua.VariantType.Float))
         node_z.set_value(ua.Variant(z, ua.VariantType.Float))
         node_angle.set_value(ua.Variant(ang, ua.VariantType.Float))
+        node_reset.set_value(ua.Variant(resetbit, ua.VariantType.Boolean))
 
-        print(f"[OPCUA] X={x:.1f}  Y={y:.1f}  Z={z:.1f}  A={ang:.1f}")
+        print(f"[OPCUA] X={x:.1f}  Y={y:.1f}  Z={z:.1f}  A={ang:.1f}  ResetBit={resetbit}")
+
     except Exception as e:
         print("[OPCUA] Write error:", e)
 
@@ -45,7 +47,6 @@ def opcua_write(node_x, node_y, node_z, node_angle, x, y, z, ang):
 # 3) YOLO OBB DETECTION
 ###############################################
 def run_detection(model, color_frame, depth_frame, intrinsics, img_w, img_h):
-    """Run YOLO → return list of detections."""
 
     img = np.asanyarray(color_frame.get_data())
     results = model(img, conf=0.5, iou=0.5)[0]
@@ -56,24 +57,22 @@ def run_detection(model, color_frame, depth_frame, intrinsics, img_w, img_h):
         return detections, img
 
     obb = results.obb
+
     for i in range(len(obb.cls)):
         cls = int(obb.cls[i])
         conf = float(obb.conf[i])
-
         poly = obb.xyxyxyxy[i].cpu().numpy().astype(int)
         x, y, w, h, r = obb.xywhr[i].cpu().numpy().astype(float)
 
-        # OBB center
+        # center
         c = np.mean(poly, axis=0).astype(int)
         cx = int(np.clip(c[0], 0, img_w - 1))
         cy = int(np.clip(c[1], 0, img_h - 1))
 
-        # Depth extraction
         d = depth_frame.get_distance(cx, cy)
         if d <= 0:
             continue
 
-        # Pixel → 3D camera point
         p_cam = rs.rs2_deproject_pixel_to_point(intrinsics, [cx, cy], d)
 
         detections.append({
@@ -93,16 +92,12 @@ def run_detection(model, color_frame, depth_frame, intrinsics, img_w, img_h):
 # 4) DRAWING
 ###############################################
 def draw(img, dets):
-    """Draw OBB + labels."""
     out = img.copy()
-
     for d in dets:
         cx, cy = d["cx"], d["cy"]
         poly = d["poly"]
         cv2.polylines(out, [poly.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
-
         cv2.circle(out, (cx, cy), 3, (0, 0, 255), -1)
-
         cv2.putText(out,
                     f"{d['class']} {d['conf']:.2f}",
                     (cx - 50, cy - 10),
@@ -114,42 +109,36 @@ def draw(img, dets):
 ###############################################
 # 5) TRANSFORMATION + MATH
 ###############################################
-# Fixed calibration camera → gripper
 R_gc = np.array([
     [0, -1, 0],
     [0,  0, 1],
     [-1, 0, 0]
 ], dtype=float)
+
 t_gc = np.array([0.085, -0.220, 0.040], dtype=float)
 
 
 def cam_to_gripper(p):
-    """3D camera → 3D gripper."""
     p = np.array(p).reshape(3, 1)
     return (R_gc @ p + t_gc.reshape(3, 1)).flatten()
 
 
 def major_axis_vector(r, w, h):
-    """Unit vector of major OBB axis in camera frame."""
     if h > w:
         r += np.pi / 2
     return np.array([np.cos(r), np.sin(r), 0.0])
 
 
 def vector_angle_xy(v):
-    """Angle of 2D vector in XY plane."""
     return np.degrees(np.arctan2(v[1], v[0])) % 180
 
 
 def compute_xyz_angle(det):
-    """Compute XYZ + angle for one detection."""
 
-    # XYZ in gripper frame
     p_cam = det["p_cam"]
     p_g = cam_to_gripper(p_cam)
-    xg, yg, zg = p_g * 1000.0  # mm
+    xg, yg, zg = p_g * 1000.0
 
-    # Angle in gripper frame
     v_cam = major_axis_vector(det["r_rad"], det["w"], det["h"])
     v_grip = R_gc @ v_cam
     ang = vector_angle_xy(v_grip)
@@ -161,9 +150,9 @@ def compute_xyz_angle(det):
 # 6) MAIN LOOP
 ###############################################
 def main():
+
     model = YOLO("epoch85.pt")
 
-    # Camera init
     pipeline = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
@@ -174,17 +163,20 @@ def main():
     intr = prof.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
     img_w, img_h = intr.width, intr.height
 
-    # OPC UA
-    client, nX, nY, nZ, nA = opcua_connect()
+    client, nX, nY, nZ, nA, nR = opcua_connect()
 
-    # Last known values (continuous streaming)
+    # last values
     lastX = lastY = lastZ = lastA = 0.0
+
+    # Stationary detection memory
+    position_buffer = deque(maxlen=150)  # 150 frames ≈ 5 sec at 30 FPS
+    stationary_triggered = False
 
     print("[SYSTEM] Running… Press ESC to quit.")
 
     try:
         while True:
-            # Get frames
+
             frames = pipeline.wait_for_frames()
             aligned = align.process(frames)
             c = aligned.get_color_frame()
@@ -192,25 +184,52 @@ def main():
             if not c or not d:
                 continue
 
-            # Detection
             dets, img = run_detection(model, c, d, intr, img_w, img_h)
 
-            # Update XYZ + angle if detection found
+            reset_bit = False
+
             if dets:
                 x, y, z, a = compute_xyz_angle(dets[0])
+
+                # push XY into buffer
+                position_buffer.append((x, y))
+
+                # measure movement
+                if len(position_buffer) == position_buffer.maxlen:
+                    xs = [p[0] for p in position_buffer]
+                    ys = [p[1] for p in position_buffer]
+
+                    dx = max(xs) - min(xs)
+                    dy = max(ys) - min(ys)
+
+                    if dx < 5 and dy < 5:   # within ±5 mm
+                        if not stationary_triggered:
+                            # first time it stays still → fire once
+                            stationary_triggered = True
+                            reset_bit = True     # fire ResetBit
+                            lastX, lastY, lastZ, lastA = x, y, z, a
+                    else:
+                        # movement detected → reset state
+                        stationary_triggered = False
+
+                # always update last values (continuous)
                 lastX, lastY, lastZ, lastA = x, y, z, a
 
-            # Continuous OPCUA write
-            opcua_write(nX, nY, nZ, nA, lastX, lastY, lastZ, lastA)
+            else:
+                # no detection → reset state
+                stationary_triggered = False
+                position_buffer.clear()
 
-            # Draw + display
+            # OPCUA write (continuous, resetBit only when triggered)
+            opcua_write(nX, nY, nZ, nA, nR, lastX, lastY, lastZ, lastA, reset_bit)
+
             vis = draw(img, dets)
             cv2.imshow("OBB + XYZ + Angle + OPCUA", vis)
 
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            time.sleep(0.05)
+            time.sleep(0.03)
 
     finally:
         client.disconnect()
